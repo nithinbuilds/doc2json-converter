@@ -1,9 +1,8 @@
 import { NextResponse } from 'next/server';
 import * as cheerio from 'cheerio';
 import {
-  isPlushSearchUrl,
-  extractQueryFromPlushUrl,
-  fetchCarouselFromUrl,
+  extractPromptQuery,
+  fetchCarouselFromQuery,
 } from '@/utils/plush-carousel';
 
 function extractGoogleDocId(url) {
@@ -371,9 +370,7 @@ function processHtmlToJSON(html, docId, blogNo) {
 
 // Split a merged paragraph's segments into prompt-based sections
 function splitIntoPromptSections(allSegments) {
-  const isPlush = (s) => isPlushSearchUrl(s.link);
-
-  // Split at \n\n into groups  
+  // Split at \n\n into groups
   const groups = [];
   let curr = [];
   for (const seg of allSegments) {
@@ -387,10 +384,12 @@ function splitIntoPromptSections(allSegments) {
   if (curr.length > 0) groups.push(curr);
 
   // A section is only a prompt if it actually contains a bolded Prompt keyword.
-  const hasPromptKeyword = (g) => g.some(s => s.bold === true && s.content.trim().toLowerCase().includes('prompt'));
-  const hasRefineKeyword = (g) => g.some(s => s.content.trim().toLowerCase().startsWith('refine'));
+  const hasPromptKeyword = (g) =>
+    g.some((s) => s.bold === true && s.content.trim().toLowerCase().includes('prompt'));
+  const hasRefineKeyword = (g) =>
+    g.some((s) => s.content.trim().toLowerCase().startsWith('refine'));
 
-  if (!groups.some(g => hasPromptKeyword(g))) return null;
+  if (!groups.some((g) => hasPromptKeyword(g))) return null;
 
   // Categorize each group strictly
   const cats = groups.map((g, i) => {
@@ -410,15 +409,27 @@ function splitIntoPromptSections(allSegments) {
       if (introSegs.length > 0) introSegs.push({ content: '\n\n' });
       introSegs.push(...segs);
     } else if (cat === 'header') {
-      sections.push({ headerSegs: segs, promptSegs: null, refineSegs: null, url: null });
+      sections.push({ headerSegs: segs, promptSegs: null, refineSegs: null, query: null });
     } else if (cat === 'prompt') {
-      const url = segs.find(isPlush)?.link || null;
+      // Groups often mix "For Black Tie\nPrompt: ..." — split header vs prompt on the Prompt keyword
+      let headerSegs = null;
+      let promptSegs = segs;
+      const promptIdx = segs.findIndex(
+        (s) => s.bold === true && s.content.trim().toLowerCase().includes('prompt')
+      );
+      if (promptIdx > 0) {
+        headerSegs = segs.slice(0, promptIdx).filter((s) => s.content !== '\n');
+        promptSegs = segs.slice(promptIdx);
+      }
+
+      const query = extractPromptQuery(promptSegs.map((s) => s.content).join(''));
       const last = sections[sections.length - 1];
       if (last && !last.promptSegs) {
-        last.promptSegs = segs;
-        last.url = url;
+        last.promptSegs = promptSegs;
+        last.query = query;
+        if (headerSegs?.length && !last.headerSegs) last.headerSegs = headerSegs;
       } else {
-        sections.push({ headerSegs: null, promptSegs: segs, refineSegs: null, url });
+        sections.push({ headerSegs, promptSegs, refineSegs: null, query });
       }
     } else if (cat === 'refine') {
       if (sections.length > 0) sections[sections.length - 1].refineSegs = segs;
@@ -428,54 +439,62 @@ function splitIntoPromptSections(allSegments) {
   return { introSegs: introSegs.length > 0 ? introSegs : null, sections };
 }
 
-async function fetchOids(url) {
+async function fetchOidsForQuery(query) {
   try {
-    const { oids } = await fetchCarouselFromUrl(url);
+    const { oids } = await fetchCarouselFromQuery(query);
     return oids;
   } catch (e) {
-    console.error('fetchOids failed for', url, e.message);
+    console.error('fetchOidsForQuery failed for', query, e.message);
     return [];
   }
 }
 
 async function autoInjectCarousels(parsedJson) {
-  // Collect all unique plush search URLs (chat / edits / results)
-  const urlSet = new Set();
-  for (const block of parsedJson.content) {
-    if (block.type === 'Paragraph') {
-      block.segments?.forEach((s) => {
-        if (isPlushSearchUrl(s.link)) urlSet.add(s.link);
-      });
-    }
+  // Find every Prompt section and use the prompt text (not the hyperlink) as the search query
+  const promptBlocks = [];
+  for (let blockIdx = 0; blockIdx < parsedJson.content.length; blockIdx++) {
+    const block = parsedJson.content[blockIdx];
+    if (block.type !== 'Paragraph') continue;
+    const hasPrompt = block.segments?.some(
+      (s) => s.bold === true && s.content.trim().toLowerCase().includes('prompt')
+    );
+    if (!hasPrompt) continue;
+    const split = splitIntoPromptSections(block.segments);
+    if (!split) continue;
+    promptBlocks.push({ blockIdx, split });
   }
 
-  // Fetch all OIDs in parallel
+  const queries = [
+    ...new Set(
+      promptBlocks.flatMap(({ split }) =>
+        split.sections.map((s) => s.query).filter(Boolean)
+      )
+    ),
+  ];
+
   const oidCache = {};
   await Promise.all(
-    [...urlSet].map(async (url) => {
-      oidCache[url] = await fetchOids(url);
+    queries.map(async (query) => {
+      oidCache[query] = await fetchOidsForQuery(query);
     })
   );
 
   const output = [];
-  for (const block of parsedJson.content) {
-    if (block.type !== 'Paragraph' || !block.segments?.some((s) => isPlushSearchUrl(s.link))) {
+
+  for (let blockIdx = 0; blockIdx < parsedJson.content.length; blockIdx++) {
+    const block = parsedJson.content[blockIdx];
+    const promptBlock = promptBlocks.find((p) => p.blockIdx === blockIdx);
+
+    if (!promptBlock) {
       output.push(block);
       continue;
     }
 
-    const split = splitIntoPromptSections(block.segments);
-    if (!split) {
-      output.push(block);
-      continue;
-    }
-
+    const { split } = promptBlock;
     for (let i = 0; i < split.sections.length; i++) {
       const sec = split.sections[i];
-      // Prompt paragraph (intro + header + prompt + refine merged)
       const promptSegs = [];
 
-      // Inject the intro blocks natively at the very top of the first section
       if (i === 0 && split.introSegs?.length) {
         promptSegs.push(...split.introSegs);
         promptSegs.push({ content: '\n\n' });
@@ -487,7 +506,6 @@ async function autoInjectCarousels(parsedJson) {
       }
       if (sec.promptSegs?.length) promptSegs.push(...sec.promptSegs);
 
-      // Merge refine paragraph seamlessly into the same block
       if (sec.refineSegs?.length) {
         if (promptSegs.length) promptSegs.push({ content: '\n\n' });
         promptSegs.push(...sec.refineSegs);
@@ -495,10 +513,13 @@ async function autoInjectCarousels(parsedJson) {
 
       if (promptSegs.length) output.push({ type: 'Paragraph', segments: promptSegs });
 
-      // Carousel — query comes from ?query= (chat) or path (edits/results)
-      if (sec.url && oidCache[sec.url]?.length) {
-        const query = extractQueryFromPlushUrl(sec.url) || '';
-        output.push({ type: 'PlushSearchCarousel', query, items: oidCache[sec.url] });
+      // Always inject a carousel for a resolved prompt — even if product fetch is empty
+      if (sec.query) {
+        output.push({
+          type: 'PlushSearchCarousel',
+          query: sec.query,
+          items: oidCache[sec.query] || [],
+        });
       }
     }
   }

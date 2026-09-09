@@ -49,14 +49,17 @@ function InsertPoint({ onInsert }) {
       newBlock.url = url;
       newBlock.altText = '';
     } else if (type === 'PlushSearchCarousel') {
-      const url = prompt('Enter Plush chat, edits, or results URL:');
-      if (!url) return;
+      const input = prompt('Enter a Plush search prompt (or chat/edits URL):');
+      if (!input) return;
       setLoading(true);
       try {
+        const body = input.includes('plush.shop/')
+          ? { url: input.trim() }
+          : { query: input.trim() };
         const res = await fetch('/api/fetch-carousel', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ url })
+          body: JSON.stringify(body)
         });
         const data = await res.json();
         if (data.error) throw new Error(data.error);
@@ -701,6 +704,32 @@ function BlockItem({ item, id, index, onChange, onDelete, onInsertAfter }) {
                 placeholder="Search query..."
                 onChange={e => handleTextEdit('query', e.target.value)}
               />
+              <button
+                type="button"
+                disabled={isFetchingProduct || !item.query}
+                title="Fetch products for this prompt"
+                onClick={async () => {
+                  if (!item.query) return;
+                  setIsFetchingProduct(true);
+                  try {
+                    const res = await fetch('/api/fetch-carousel', {
+                      method: 'POST',
+                      headers: { 'Content-Type': 'application/json' },
+                      body: JSON.stringify({ query: item.query }),
+                    });
+                    const data = await res.json();
+                    if (data.error) throw new Error(data.error);
+                    handleTextEdit('items', data.oids || []);
+                  } catch (err) {
+                    alert('Failed to fetch products: ' + err.message);
+                  } finally {
+                    setIsFetchingProduct(false);
+                  }
+                }}
+                className="shrink-0 bg-indigo-50 hover:bg-indigo-100 text-indigo-600 text-[10px] font-semibold px-2 py-1.5 rounded transition-colors disabled:opacity-50"
+              >
+                {isFetchingProduct ? '...' : 'Fetch'}
+              </button>
             </div>
             <div>
               <div className="flex items-center justify-between mb-2 mt-4 inline-block w-full">

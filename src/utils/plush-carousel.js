@@ -1,6 +1,10 @@
 import * as cheerio from 'cheerio';
+import { randomUUID } from 'crypto';
 
 const SEARCH_PATH_RE = /plush\.shop\/(chat|edits|results)\//;
+const PLUSH_GRAPHQL = process.env.PLUSH_API_ENDPOINT
+  ? `${process.env.PLUSH_API_ENDPOINT.replace(/\/$/, '')}/query`
+  : 'https://api.plush.shop/query';
 
 export function isPlushSearchUrl(url) {
   return Boolean(url && SEARCH_PATH_RE.test(url));
@@ -17,11 +21,18 @@ export function encodePlushQuery(query) {
 
 export function decodePlushQuery(raw) {
   if (!raw) return '';
-  try {
-    return decodeURIComponent(String(raw).replace(/\+/g, ' '));
-  } catch {
-    return String(raw).replace(/\+/g, ' ');
+  let value = String(raw).replace(/\+/g, ' ');
+  // Google Docs often double-encodes path segments (%252C → %2C → ,)
+  for (let i = 0; i < 3; i++) {
+    try {
+      const next = decodeURIComponent(value);
+      if (next === value) break;
+      value = next;
+    } catch {
+      break;
+    }
   }
+  return value.replace(/\+/g, ' ').trim();
 }
 
 /**
@@ -39,13 +50,29 @@ export function extractQueryFromPlushUrl(url) {
     const match = u.pathname.match(/\/(?:edits|results)\/(.+)/);
     if (match) return decodePlushQuery(match[1]);
   } catch {
-    // Fallback for non-absolute URLs
     const chatMatch = url.match(/[?&]query=([^&]+)/);
     if (chatMatch) return decodePlushQuery(chatMatch[1]);
     const pathMatch = url.match(/\/(?:edits|results)\/([^?#]+)/);
     if (pathMatch) return decodePlushQuery(pathMatch[1]);
   }
   return null;
+}
+
+/**
+ * Pull the search string out of a "Prompt: ..." text block.
+ * Ignores hyperlinks — uses the visible prompt copy.
+ */
+export function extractPromptQuery(text) {
+  if (!text) return null;
+  const normalized = String(text).replace(/\u00a0/g, ' ').trim();
+  const match = normalized.match(
+    /prompt\s*:\s*[""'\u201c\u201d]?([\s\S]*?)[""'\u201c\u201d]?\s*$/i
+  );
+  if (!match) return null;
+  return match[1]
+    .replace(/^[""'\u201c\u201d]+|[""'\u201c\u201d]+$/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
 }
 
 export function editsUrlForQuery(query) {
@@ -166,11 +193,14 @@ function extractFromDomListing(html, productsByName, { limit = 8 } = {}) {
 }
 
 export function extractOidsFromHtml(html, { limit = 8 } = {}) {
-  // 1) Prefer search edges (stable on /edits SSR payloads)
+  // Soft 404 pages still return HTTP 200
+  if (/404\s*-\s*Page Not Found/i.test(html) && !/"__typename":"ItemEdge"/.test(html)) {
+    return [];
+  }
+
   const fromEdges = extractFromItemEdges(html, { limit });
   if (fromEdges.length > 0) return fromEdges;
 
-  // 2) Legacy results pages: Apollo/DOM name matching
   const productsByName = {
     ...parseApolloItems(html),
     ...parseEmbeddedItems(html),
@@ -178,7 +208,6 @@ export function extractOidsFromHtml(html, { limit = 8 } = {}) {
   const fromDom = extractFromDomListing(html, productsByName, { limit });
   if (fromDom.length > 0) return fromDom;
 
-  // 3) Last resort: first embedded items
   const oids = [];
   const seen = new Set();
   for (const item of Object.values(productsByName)) {
@@ -196,22 +225,68 @@ const FETCH_HEADERS = {
   Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
 };
 
-/**
- * Fetch carousel products for a Plush chat / edits / results URL.
- * Always loads the edits page for the query — chat pages are client-only shells
- * and chat IDs are not reusable.
- */
-export async function fetchCarouselFromUrl(url, { limit = 8 } = {}) {
-  if (!isPlushSearchUrl(url)) {
-    throw new Error('Invalid plush.shop search URL (expected /chat/, /edits/, or /results/)');
+const SEARCH_QUERY = `
+  query SearchItem($query: String!, $first: Int!, $skipPersonalization: Boolean, $type: Search_Type) {
+    search(query: $query, first: $first, skipPersonalization: $skipPersonalization, type: $type) {
+      items {
+        edges {
+          node {
+            id
+            name
+            thumbnailImage
+            itemBrand { name }
+          }
+        }
+      }
+    }
+  }
+`;
+
+async function fetchOidsViaGraphQL(query, { limit = 8 } = {}) {
+  const response = await fetch(PLUSH_GRAPHQL, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      accept: 'application/json',
+      origin: 'https://www.plush.shop',
+      referer: 'https://www.plush.shop/',
+      'user-agent': FETCH_HEADERS['User-Agent'],
+      'x-device-id': randomUUID(),
+    },
+    body: JSON.stringify({
+      operationName: 'SearchItem',
+      query: SEARCH_QUERY,
+      variables: {
+        query,
+        first: limit,
+        skipPersonalization: true,
+        type: 'ITEM',
+      },
+    }),
+  });
+
+  if (!response.ok) {
+    throw new Error(`GraphQL HTTP ${response.status}`);
   }
 
-  const resolved = resolveSearchFetchUrl(url);
-  if (!resolved?.query) {
-    throw new Error('Could not extract search query from URL');
+  const payload = await response.json();
+  if (payload.errors?.length) {
+    const msg = payload.errors.map((e) => e.message).join('; ');
+    const err = new Error(msg);
+    err.code = payload.errors[0]?.extensions?.code;
+    throw err;
   }
 
-  const response = await fetch(resolved.fetchUrl, {
+  const edges = payload.data?.search?.items?.edges || [];
+  return edges
+    .map((edge) => edge?.node)
+    .filter((node) => node?.id)
+    .slice(0, limit)
+    .map((node) => toOidEntry(node));
+}
+
+async function fetchOidsViaEditsPage(query, { limit = 8 } = {}) {
+  const response = await fetch(editsUrlForQuery(query), {
     headers: FETCH_HEADERS,
     redirect: 'follow',
   });
@@ -223,6 +298,43 @@ export async function fetchCarouselFromUrl(url, { limit = 8 } = {}) {
   }
 
   const html = await response.text();
-  const oids = extractOidsFromHtml(html, { limit });
-  return { oids, query: resolved.query, found: oids.length };
+  return extractOidsFromHtml(html, { limit });
+}
+
+/**
+ * Fetch carousel products for a natural-language prompt / search query.
+ * Prefers the same GraphQL search chat uses; falls back to scraping /edits.
+ */
+export async function fetchCarouselFromQuery(query, { limit = 8 } = {}) {
+  const cleaned = String(query || '').replace(/\s+/g, ' ').trim();
+  if (!cleaned) {
+    throw new Error('Search query is required');
+  }
+
+  try {
+    const oids = await fetchOidsViaGraphQL(cleaned, { limit });
+    if (oids.length) return { oids, query: cleaned, found: oids.length, source: 'graphql' };
+  } catch (e) {
+    console.warn('GraphQL carousel fetch failed:', e.message);
+  }
+
+  const oids = await fetchOidsViaEditsPage(cleaned, { limit });
+  return { oids, query: cleaned, found: oids.length, source: 'edits' };
+}
+
+/**
+ * Fetch carousel products for a Plush chat / edits / results URL.
+ * Extracts the stable query string — chat IDs are not reusable.
+ */
+export async function fetchCarouselFromUrl(url, { limit = 8 } = {}) {
+  if (!isPlushSearchUrl(url)) {
+    throw new Error('Invalid plush.shop search URL (expected /chat/, /edits/, or /results/)');
+  }
+
+  const query = extractQueryFromPlushUrl(url);
+  if (!query) {
+    throw new Error('Could not extract search query from URL');
+  }
+
+  return fetchCarouselFromQuery(query, { limit });
 }
