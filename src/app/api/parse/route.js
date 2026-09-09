@@ -1,5 +1,10 @@
 import { NextResponse } from 'next/server';
 import * as cheerio from 'cheerio';
+import {
+  isPlushSearchUrl,
+  extractQueryFromPlushUrl,
+  fetchCarouselFromUrl,
+} from '@/utils/plush-carousel';
 
 function extractGoogleDocId(url) {
   const match = url.match(/\/d\/([a-zA-Z0-9-_]+)/);
@@ -366,7 +371,7 @@ function processHtmlToJSON(html, docId, blogNo) {
 
 // Split a merged paragraph's segments into prompt-based sections
 function splitIntoPromptSections(allSegments) {
-  const isPlush = (s) => s.link?.includes('plush.shop/results/');
+  const isPlush = (s) => isPlushSearchUrl(s.link);
 
   // Split at \n\n into groups  
   const groups = [];
@@ -425,55 +430,7 @@ function splitIntoPromptSections(allSegments) {
 
 async function fetchOids(url) {
   try {
-    const resp = await fetch(url, {
-      headers: { 'User-Agent': 'Mozilla/5.0 (compatible; Doc2JSON/1.0)' },
-      redirect: 'follow',
-    });
-    if (!resp.ok) return [];
-    const html = await resp.text();
-    const $ = cheerio.load(html);
-    
-    // Parse the Next.js Apollo state to get name and image details for OID mapping
-    let apolloState = {};
-    const matchData = html.match(/id="__NEXT_DATA__"[^>]*>([\s\S]+?)<\/script>/);
-    if (matchData) {
-      try {
-        const nextData = JSON.parse(matchData[1]);
-        apolloState = nextData.props?.pageProps?.__APOLLO_STATE__ || {};
-      } catch (e) {
-        console.error('Failed to parse __NEXT_DATA__');
-      }
-    }
-
-    const productsByName = {};
-    Object.values(apolloState).forEach(item => {
-      if (item.__typename === 'Item' && item.name) {
-        productsByName[item.name.trim()] = item;
-      }
-    });
-
-    const oids = [];
-    const seenMap = new Set();
-    $('.product-list .product_listing_item').each((i, el) => {
-      if (oids.length >= 8) return;
-      
-      const nameStr = $(el).find('.goods-name-text').text().trim();
-      const brandStr = $(el).find('.brand-price').text().trim();
-      const imgStr = $(el).find('.item_img_over img').first().attr('src');
-      
-      if (nameStr) {
-        const itemInfo = productsByName[nameStr];
-        if (itemInfo && !seenMap.has(itemInfo.id)) {
-          seenMap.add(itemInfo.id);
-          oids.push({
-            $oid: itemInfo.id,
-            imageUrl: itemInfo.thumbnailImage || imgStr,
-            name: brandStr || nameStr
-          });
-        }
-      }
-    });
-
+    const { oids } = await fetchCarouselFromUrl(url);
     return oids;
   } catch (e) {
     console.error('fetchOids failed for', url, e.message);
@@ -482,44 +439,54 @@ async function fetchOids(url) {
 }
 
 async function autoInjectCarousels(parsedJson) {
-  // Collect all unique plush URLs to fetch concurrently
+  // Collect all unique plush search URLs (chat / edits / results)
   const urlSet = new Set();
   for (const block of parsedJson.content) {
     if (block.type === 'Paragraph') {
-      block.segments?.forEach(s => { if (s.link?.includes('plush.shop/results/')) urlSet.add(s.link); });
+      block.segments?.forEach((s) => {
+        if (isPlushSearchUrl(s.link)) urlSet.add(s.link);
+      });
     }
   }
 
   // Fetch all OIDs in parallel
   const oidCache = {};
-  await Promise.all([...urlSet].map(async (url) => {
-    oidCache[url] = await fetchOids(url);
-  }));
+  await Promise.all(
+    [...urlSet].map(async (url) => {
+      oidCache[url] = await fetchOids(url);
+    })
+  );
 
   const output = [];
   for (const block of parsedJson.content) {
-    if (block.type !== 'Paragraph' || !block.segments?.some(s => s.link?.includes('plush.shop/results/'))) {
+    if (block.type !== 'Paragraph' || !block.segments?.some((s) => isPlushSearchUrl(s.link))) {
       output.push(block);
       continue;
     }
 
     const split = splitIntoPromptSections(block.segments);
-    if (!split) { output.push(block); continue; }
+    if (!split) {
+      output.push(block);
+      continue;
+    }
 
     for (let i = 0; i < split.sections.length; i++) {
       const sec = split.sections[i];
       // Prompt paragraph (intro + header + prompt + refine merged)
       const promptSegs = [];
-      
+
       // Inject the intro blocks natively at the very top of the first section
       if (i === 0 && split.introSegs?.length) {
         promptSegs.push(...split.introSegs);
         promptSegs.push({ content: '\n\n' });
       }
 
-      if (sec.headerSegs?.length) { promptSegs.push(...sec.headerSegs); promptSegs.push({ content: '\n\n' }); }
+      if (sec.headerSegs?.length) {
+        promptSegs.push(...sec.headerSegs);
+        promptSegs.push({ content: '\n\n' });
+      }
       if (sec.promptSegs?.length) promptSegs.push(...sec.promptSegs);
-      
+
       // Merge refine paragraph seamlessly into the same block
       if (sec.refineSegs?.length) {
         if (promptSegs.length) promptSegs.push({ content: '\n\n' });
@@ -528,9 +495,9 @@ async function autoInjectCarousels(parsedJson) {
 
       if (promptSegs.length) output.push({ type: 'Paragraph', segments: promptSegs });
 
-      // Carousel
+      // Carousel — query comes from ?query= (chat) or path (edits/results)
       if (sec.url && oidCache[sec.url]?.length) {
-        const query = decodeURIComponent(sec.url.split('/results/')[1] || '').replace(/\+/g, ' ');
+        const query = extractQueryFromPlushUrl(sec.url) || '';
         output.push({ type: 'PlushSearchCarousel', query, items: oidCache[sec.url] });
       }
     }

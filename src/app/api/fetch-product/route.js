@@ -1,16 +1,34 @@
 import { NextResponse } from 'next/server';
 import * as cheerio from 'cheerio';
+import {
+  isPlushProductUrl,
+  isPlushSearchUrl,
+  fetchCarouselFromUrl,
+} from '@/utils/plush-carousel';
 
 export async function POST(req) {
   try {
     const { url } = await req.json();
-    if (!url || (!url.includes('plush.shop/product/') && !url.includes('plush.shop/results/'))) {
-      return NextResponse.json({ error: 'Invalid plush.shop product URL' }, { status: 400 });
+    if (!url || (!isPlushProductUrl(url) && !isPlushSearchUrl(url))) {
+      return NextResponse.json(
+        { error: 'Invalid plush.shop product or search URL' },
+        { status: 400 }
+      );
+    }
+
+    // Search URLs (chat / edits / results): return the first carousel product
+    if (isPlushSearchUrl(url) && !isPlushProductUrl(url)) {
+      const { oids } = await fetchCarouselFromUrl(url, { limit: 1 });
+      if (!oids.length) {
+        return NextResponse.json({ error: 'Could not identify product OID' }, { status: 404 });
+      }
+      return NextResponse.json(oids[0]);
     }
 
     const response = await fetch(url, {
       headers: {
-        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'User-Agent':
+          'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
       },
       redirect: 'follow',
     });
@@ -36,25 +54,26 @@ export async function POST(req) {
     }
 
     // Find the item in the Apollo state
-    const item = Object.values(apolloState).find(v => v.__typename === 'Item');
-    
+    const item = Object.values(apolloState).find((v) => v.__typename === 'Item');
+
     if (!item) {
-      // Fallback: try to extract from OID in URL if state parsing fails
+      // Fallback: try embedded Item JSON, then OID in URL
+      const embedded = html.match(/\{"__typename":"Item","id":"([a-f0-9]{24})"/);
       const oidMatch = url.match(/\/([a-f0-9]{24})/);
-      const oid = oidMatch ? oidMatch[1] : null;
+      const oid = embedded?.[1] || (oidMatch ? oidMatch[1] : null);
       if (!oid) return NextResponse.json({ error: 'Could not identify product OID' }, { status: 404 });
-      
+
       return NextResponse.json({
         $oid: oid,
         name: 'Product',
-        imageUrl: null
+        imageUrl: null,
       });
     }
 
     return NextResponse.json({
       $oid: item.id,
       name: item.brand || item.name,
-      imageUrl: item.thumbnailImage
+      imageUrl: item.thumbnailImage,
     });
   } catch (error) {
     console.error('fetch-product error:', error);

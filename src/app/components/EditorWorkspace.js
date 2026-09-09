@@ -49,7 +49,7 @@ function InsertPoint({ onInsert }) {
       newBlock.url = url;
       newBlock.altText = '';
     } else if (type === 'PlushSearchCarousel') {
-      const url = prompt('Enter Plush Collection URL:');
+      const url = prompt('Enter Plush chat, edits, or results URL:');
       if (!url) return;
       setLoading(true);
       try {
