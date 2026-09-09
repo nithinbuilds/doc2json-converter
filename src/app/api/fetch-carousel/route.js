@@ -5,6 +5,9 @@ import {
   isPlushSearchUrl,
 } from '@/utils/plush-carousel';
 
+export const runtime = 'nodejs';
+export const maxDuration = 300;
+
 export async function POST(req) {
   try {
     const body = await req.json();
@@ -21,7 +24,6 @@ export async function POST(req) {
     }
 
     if (url && String(url).trim() && !String(url).includes('://')) {
-      // Treat bare text pasted into the URL field as a prompt
       const result = await fetchCarouselFromQuery(String(url).trim());
       return NextResponse.json(result);
     }
@@ -34,7 +36,9 @@ export async function POST(req) {
     console.error('fetch-carousel error:', error);
     const status =
       error.status ||
-      (error.message?.includes('Invalid') || error.message?.includes('required') || error.message?.includes('extract')
+      (error.message?.includes('Invalid') ||
+      error.message?.includes('required') ||
+      error.message?.includes('extract')
         ? 400
         : 500);
     return NextResponse.json({ error: error.message }, { status });

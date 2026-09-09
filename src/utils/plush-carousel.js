@@ -1,4 +1,7 @@
-import { fetchProductsViaChat } from './plush-chat-fetch.js';
+import {
+  fetchCarouselFromQuery as fetchViaWorker,
+  fetchCarouselFromQueries as fetchBatchViaWorker,
+} from './plush-chat-worker.js';
 
 const SEARCH_PATH_RE = /plush\.shop\/(chat|edits|results)\//;
 
@@ -18,7 +21,6 @@ export function encodePlushQuery(query) {
 export function decodePlushQuery(raw) {
   if (!raw) return '';
   let value = String(raw).replace(/\+/g, ' ');
-  // Google Docs often double-encodes path segments (%252C → %2C → ,)
   for (let i = 0; i < 3; i++) {
     try {
       const next = decodeURIComponent(value);
@@ -75,39 +77,30 @@ export function editsUrlForQuery(query) {
   return `https://www.plush.shop/edits/${encodePlushQuery(query)}?type=ITEM`;
 }
 
-/** Resolve any search URL to query + edits URL (legacy helper). */
 export function resolveSearchFetchUrl(url) {
   const query = extractQueryFromPlushUrl(url);
   if (!query) return null;
   return { query, fetchUrl: editsUrlForQuery(query) };
 }
 
-/**
- * Fetch carousel products for a natural-language prompt via Plush chat.
- * createChat → sendChatMessage → getResultBySearchId
- */
+/** Fetch carousel products for one prompt via Plush chat (worker process). */
 export async function fetchCarouselFromQuery(query, { limit = 8 } = {}) {
-  const cleaned = String(query || '').replace(/\s+/g, ' ').trim();
-  if (!cleaned) {
-    throw new Error('Search query is required');
-  }
-
-  return fetchProductsViaChat(cleaned, { limit });
+  return fetchViaWorker(query, { limit });
 }
 
-/**
- * Fetch carousel products for a Plush chat / edits / results URL.
- * Extracts the stable query string — chat IDs are not reusable.
- */
+/** Batch fetch — one Chrome/Turnstile session for many prompts. */
+export async function fetchCarouselFromQueries(queries, { limit = 8 } = {}) {
+  return fetchBatchViaWorker(queries, { limit });
+}
+
+/** Fetch from a Plush chat / edits / results URL (uses query string only). */
 export async function fetchCarouselFromUrl(url, { limit = 8 } = {}) {
   if (!isPlushSearchUrl(url)) {
     throw new Error('Invalid plush.shop search URL (expected /chat/, /edits/, or /results/)');
   }
-
   const query = extractQueryFromPlushUrl(url);
   if (!query) {
     throw new Error('Could not extract search query from URL');
   }
-
   return fetchCarouselFromQuery(query, { limit });
 }

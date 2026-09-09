@@ -85,8 +85,17 @@ const GET_RESULT_BY_SEARCH_ID = `
   }
 `;
 
-/** Reuse one verified session across carousel fetches in the same Node process. */
-let sessionCache = null; // { ticket, expiresAt, deviceId }
+/** Serialize Chrome usage — parallel Chromes break Turnstile / ports. */
+let chain = Promise.resolve();
+
+function enqueue(fn) {
+  const run = chain.then(fn, fn);
+  chain = run.then(
+    () => {},
+    () => {}
+  );
+  return run;
+}
 
 function findChrome() {
   for (const candidate of CHROME_CANDIDATES) {
@@ -151,14 +160,19 @@ async function withChromePage(fn) {
       '--no-default-browser-check',
       '--disable-gpu',
       '--window-size=1200,900',
+      '--disable-background-timer-throttling',
       'about:blank',
     ],
-    { stdio: 'ignore' }
+    {
+      stdio: 'ignore',
+      // Detach from Next.js request lifecycle quirks on macOS
+      detached: false,
+    }
   );
 
   try {
     let version;
-    for (let i = 0; i < 40; i++) {
+    for (let i = 0; i < 60; i++) {
       await new Promise((r) => setTimeout(r, 250));
       try {
         version = await fetch(`http://127.0.0.1:${port}/json/version`).then((r) => r.json());
@@ -180,7 +194,7 @@ async function withChromePage(fn) {
     await send('Page.enable');
     await send('Runtime.enable');
     await send('Page.navigate', { url: PLUSH_ORIGIN });
-    await new Promise((r) => setTimeout(r, 3500));
+    await new Promise((r) => setTimeout(r, 4000));
 
     const evaluate = async (expression) => {
       const result = await send('Runtime.evaluate', {
@@ -199,7 +213,7 @@ async function withChromePage(fn) {
     };
 
     try {
-      return await fn({ evaluate, browser, send });
+      return await fn({ evaluate });
     } finally {
       browser.close();
     }
@@ -221,160 +235,178 @@ function toOidEntry(node) {
   };
 }
 
+function buildPageScript(prompts, limit) {
+  return `(async () => {
+    const sitekey = ${JSON.stringify(TURNSTILE_SITE_KEY)};
+    const prompts = ${JSON.stringify(prompts)};
+    const limit = ${Number(limit) || 8};
+    const deviceId = (document.cookie.match(/p_device_id=([^;]+)/) || [])[1] || crypto.randomUUID();
+
+    const gql = async (queryDoc, variables, ticket) => {
+      const headers = {
+        'Content-Type': 'application/json',
+        'x-device-id': deviceId,
+      };
+      if (ticket) headers['X-Human-Ticket'] = ticket;
+      const res = await fetch('/api/graphql', {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ query: queryDoc, variables }),
+      });
+      return res.json();
+    };
+
+    await new Promise((resolve, reject) => {
+      if (window.turnstile) return resolve();
+      const s = document.createElement('script');
+      s.src = 'https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit';
+      s.onload = resolve;
+      s.onerror = () => reject(new Error('Failed to load Turnstile'));
+      document.head.appendChild(s);
+    });
+
+    const host = document.createElement('div');
+    document.body.appendChild(host);
+    const token = await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('Turnstile timed out')), 45000);
+      window.turnstile.render(host, {
+        sitekey,
+        action: 'verify_human',
+        callback: (tok) => { clearTimeout(timer); resolve(tok); },
+        'error-callback': (code) => {
+          clearTimeout(timer);
+          reject(new Error('Turnstile error ' + code));
+        },
+      });
+    });
+
+    const verify = await gql(${JSON.stringify(VERIFY_HUMAN)}, { input: { token } }, null);
+    const ticket = verify.data?.verifyHuman?.ticket;
+    if (!ticket) {
+      throw new Error(verify.errors?.[0]?.message || 'verifyHuman returned no ticket');
+    }
+
+    const results = [];
+    for (const prompt of prompts) {
+      try {
+        const created = await gql(${JSON.stringify(CREATE_CHAT)}, undefined, ticket);
+        const chatId = created.data?.createChat?.chat?.id;
+        if (!chatId) throw new Error(created.errors?.[0]?.message || 'createChat failed');
+
+        const sent = await gql(
+          ${JSON.stringify(SEND_CHAT_MESSAGE)},
+          { input: { chatID: chatId, text: prompt } },
+          ticket
+        );
+        if (sent.errors?.length) {
+          throw new Error(sent.errors[0].message || 'sendChatMessage failed');
+        }
+
+        let searchID = null;
+        let directItems = [];
+        for (let i = 0; i < 15; i++) {
+          await new Promise((r) => setTimeout(r, 1500));
+          const poll = await gql(${JSON.stringify(CHAT_MESSAGES)}, { id: chatId }, ticket);
+          if (poll.errors?.length) {
+            throw new Error(poll.errors[0].message || 'chat poll failed');
+          }
+          const nodes = poll.data?.chat?.messages?.edges?.map((e) => e.node) || [];
+          directItems = nodes.filter((n) => n.item?.id).map((n) => n.item);
+          const searchMsg = nodes.find((n) => n.searchResultInfo?.searchID);
+          if (directItems.length >= limit) break;
+          if (searchMsg) {
+            searchID = searchMsg.searchResultInfo.searchID;
+            break;
+          }
+        }
+
+        let items = directItems.slice(0, limit);
+        if (searchID && items.length < limit) {
+          const result = await gql(
+            ${JSON.stringify(GET_RESULT_BY_SEARCH_ID)},
+            { input: { id: searchID, first: limit } },
+            ticket
+          );
+          if (result.errors?.length) {
+            throw new Error(result.errors[0].message || 'getResultBySearchId failed');
+          }
+          const edges = result.data?.getResultBySearchId?.items?.edges || [];
+          items = edges.map((e) => e.node).filter((n) => n?.id).slice(0, limit);
+        }
+
+        results.push({
+          query: prompt,
+          chatId,
+          searchID,
+          items,
+          error: null,
+        });
+      } catch (err) {
+        results.push({
+          query: prompt,
+          chatId: null,
+          searchID: null,
+          items: [],
+          error: String(err?.message || err),
+        });
+      }
+    }
+
+    return results;
+  })()`;
+}
+
+function formatResult(row, limit = 8) {
+  const oids = (row.items || []).slice(0, limit).map(toOidEntry);
+  return {
+    oids,
+    query: row.query,
+    found: oids.length,
+    source: 'chat',
+    chatId: row.chatId,
+    searchID: row.searchID,
+    error: row.error || null,
+  };
+}
+
 /**
- * Chat-based product fetch for a natural-language prompt:
- * Turnstile → verifyHuman → createChat → sendChatMessage → getResultBySearchId
+ * Fetch products for many prompts in one Chrome + Turnstile session.
+ */
+export async function fetchProductsViaChatBatch(prompts, { limit = 8 } = {}) {
+  const cleaned = [...new Set(
+    (prompts || [])
+      .map((p) => String(p || '').replace(/\s+/g, ' ').trim())
+      .filter(Boolean)
+  )];
+
+  if (!cleaned.length) return {};
+
+  return enqueue(async () => {
+    const rows = await withChromePage(async ({ evaluate }) => {
+      return evaluate(buildPageScript(cleaned, limit));
+    });
+
+    const byQuery = {};
+    for (const row of rows) {
+      byQuery[row.query] = formatResult(row, limit);
+      if (row.error) {
+        console.error('chat fetch failed for', row.query, row.error);
+      }
+    }
+    return byQuery;
+  });
+}
+
+/**
+ * Chat-based product fetch for a single prompt.
  */
 export async function fetchProductsViaChat(prompt, { limit = 8 } = {}) {
   const query = String(prompt || '').replace(/\s+/g, ' ').trim();
   if (!query) throw new Error('Search query is required');
 
-  const cached =
-    sessionCache && sessionCache.expiresAt - Date.now() > 60_000 ? sessionCache : null;
-
-  const payload = await withChromePage(async ({ evaluate }) => {
-    return evaluate(`(async () => {
-      const sitekey = ${JSON.stringify(TURNSTILE_SITE_KEY)};
-      const prompt = ${JSON.stringify(query)};
-      const limit = ${Number(limit) || 8};
-      let ticket = ${JSON.stringify(cached?.ticket || null)};
-      let deviceId = ${JSON.stringify(cached?.deviceId || null)};
-      let expiresAt = ${Number(cached?.expiresAt || 0)};
-
-      if (!deviceId) {
-        deviceId = (document.cookie.match(/p_device_id=([^;]+)/) || [])[1] || crypto.randomUUID();
-      }
-
-      const gql = async (queryDoc, variables) => {
-        const headers = {
-          'Content-Type': 'application/json',
-          'x-device-id': deviceId,
-        };
-        if (ticket) headers['X-Human-Ticket'] = ticket;
-        const res = await fetch('/api/graphql', {
-          method: 'POST',
-          headers,
-          body: JSON.stringify({ query: queryDoc, variables }),
-        });
-        return res.json();
-      };
-
-      if (!ticket) {
-        await new Promise((resolve, reject) => {
-          if (window.turnstile) return resolve();
-          const s = document.createElement('script');
-          s.src = 'https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit';
-          s.onload = resolve;
-          s.onerror = () => reject(new Error('Failed to load Turnstile'));
-          document.head.appendChild(s);
-        });
-
-        const host = document.createElement('div');
-        document.body.appendChild(host);
-        const token = await new Promise((resolve, reject) => {
-          const timer = setTimeout(() => reject(new Error('Turnstile timed out')), 45000);
-          window.turnstile.render(host, {
-            sitekey,
-            action: 'verify_human',
-            callback: (tok) => { clearTimeout(timer); resolve(tok); },
-            'error-callback': (code) => {
-              clearTimeout(timer);
-              reject(new Error('Turnstile error ' + code));
-            },
-          });
-        });
-
-        const verify = await gql(${JSON.stringify(VERIFY_HUMAN)}, { input: { token } });
-        ticket = verify.data?.verifyHuman?.ticket;
-        expiresAt = Date.parse(verify.data?.verifyHuman?.expiresAt || '') || (Date.now() + 25 * 60 * 1000);
-        if (!ticket) {
-          throw new Error(verify.errors?.[0]?.message || 'verifyHuman returned no ticket');
-        }
-      }
-
-      const created = await gql(${JSON.stringify(CREATE_CHAT)});
-      const chatId = created.data?.createChat?.chat?.id;
-      if (!chatId) {
-        throw new Error(created.errors?.[0]?.message || 'createChat failed');
-      }
-
-      const sent = await gql(${JSON.stringify(SEND_CHAT_MESSAGE)}, {
-        input: { chatID: chatId, text: prompt },
-      });
-      if (sent.errors?.length) {
-        throw new Error(sent.errors[0].message || 'sendChatMessage failed');
-      }
-
-      let searchID = null;
-      let directItems = [];
-      for (let i = 0; i < 15; i++) {
-        await new Promise((r) => setTimeout(r, 1500));
-        const poll = await gql(${JSON.stringify(CHAT_MESSAGES)}, { id: chatId });
-        if (poll.errors?.length) {
-          throw new Error(poll.errors[0].message || 'chat poll failed');
-        }
-        const nodes = poll.data?.chat?.messages?.edges?.map((e) => e.node) || [];
-        directItems = nodes.filter((n) => n.item?.id).map((n) => n.item);
-        const searchMsg = nodes.find((n) => n.searchResultInfo?.searchID);
-        if (directItems.length >= limit) {
-          return {
-            ticket,
-            expiresAt,
-            deviceId,
-            chatId,
-            searchID,
-            items: directItems.slice(0, limit),
-          };
-        }
-        if (searchMsg) {
-          searchID = searchMsg.searchResultInfo.searchID;
-          break;
-        }
-      }
-
-      if (!searchID) {
-        return {
-          ticket,
-          expiresAt,
-          deviceId,
-          chatId,
-          searchID: null,
-          items: directItems.slice(0, limit),
-        };
-      }
-
-      const result = await gql(${JSON.stringify(GET_RESULT_BY_SEARCH_ID)}, {
-        input: { id: searchID, first: limit },
-      });
-      if (result.errors?.length) {
-        throw new Error(result.errors[0].message || 'getResultBySearchId failed');
-      }
-      const edges = result.data?.getResultBySearchId?.items?.edges || [];
-      const items = edges.map((e) => e.node).filter((n) => n?.id);
-      return {
-        ticket,
-        expiresAt,
-        deviceId,
-        chatId,
-        searchID,
-        items: items.slice(0, limit),
-      };
-    })()`);
-  });
-
-  sessionCache = {
-    ticket: payload.ticket,
-    expiresAt: payload.expiresAt,
-    deviceId: payload.deviceId,
-  };
-
-  const oids = (payload.items || []).map(toOidEntry);
-  return {
-    oids,
-    query,
-    found: oids.length,
-    source: 'chat',
-    chatId: payload.chatId,
-    searchID: payload.searchID,
-  };
+  const byQuery = await fetchProductsViaChatBatch([query], { limit });
+  const result = byQuery[query];
+  if (!result) throw new Error('Chat fetch returned no result');
+  if (result.error && !result.found) throw new Error(result.error);
+  return result;
 }

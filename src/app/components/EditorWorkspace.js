@@ -707,7 +707,7 @@ function BlockItem({ item, id, index, onChange, onDelete, onInsertAfter }) {
               <button
                 type="button"
                 disabled={isFetchingProduct || !item.query}
-                title="Fetch products for this prompt"
+                title="Fetch products via Plush chat (opens Chrome briefly for verification)"
                 onClick={async () => {
                   if (!item.query) return;
                   setIsFetchingProduct(true);
@@ -719,7 +719,10 @@ function BlockItem({ item, id, index, onChange, onDelete, onInsertAfter }) {
                     });
                     const data = await res.json();
                     if (data.error) throw new Error(data.error);
-                    handleTextEdit('items', data.oids || []);
+                    if (!data.oids?.length) {
+                      throw new Error(data.error || 'No products returned from chat search. Try Fetch again.');
+                    }
+                    handleTextEdit('items', data.oids);
                   } catch (err) {
                     alert('Failed to fetch products: ' + err.message);
                   } finally {
@@ -728,7 +731,7 @@ function BlockItem({ item, id, index, onChange, onDelete, onInsertAfter }) {
                 }}
                 className="shrink-0 bg-indigo-50 hover:bg-indigo-100 text-indigo-600 text-[10px] font-semibold px-2 py-1.5 rounded transition-colors disabled:opacity-50"
               >
-                {isFetchingProduct ? '...' : 'Fetch'}
+                {isFetchingProduct ? 'Chat…' : 'Fetch'}
               </button>
             </div>
             <div>

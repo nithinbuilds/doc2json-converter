@@ -2,8 +2,11 @@ import { NextResponse } from 'next/server';
 import * as cheerio from 'cheerio';
 import {
   extractPromptQuery,
-  fetchCarouselFromQuery,
+  fetchCarouselFromQueries,
 } from '@/utils/plush-carousel';
+
+export const runtime = 'nodejs';
+export const maxDuration = 300;
 
 function extractGoogleDocId(url) {
   const match = url.match(/\/d\/([a-zA-Z0-9-_]+)/);
@@ -439,16 +442,6 @@ function splitIntoPromptSections(allSegments) {
   return { introSegs: introSegs.length > 0 ? introSegs : null, sections };
 }
 
-async function fetchOidsForQuery(query) {
-  try {
-    const { oids } = await fetchCarouselFromQuery(query);
-    return oids;
-  } catch (e) {
-    console.error('fetchOidsForQuery failed for', query, e.message);
-    return [];
-  }
-}
-
 async function autoInjectCarousels(parsedJson) {
   // Find every Prompt section and use the prompt text (not the hyperlink) as the search query
   const promptBlocks = [];
@@ -472,12 +465,22 @@ async function autoInjectCarousels(parsedJson) {
     ),
   ];
 
-  const oidCache = {};
-  await Promise.all(
-    queries.map(async (query) => {
-      oidCache[query] = await fetchOidsForQuery(query);
-    })
-  );
+  // One Chrome session for all prompts (parallel Chromes break Turnstile)
+  let oidCache = {};
+  if (queries.length) {
+    try {
+      const byQuery = await fetchCarouselFromQueries(queries);
+      for (const query of queries) {
+        oidCache[query] = byQuery[query]?.oids || [];
+        if (byQuery[query]?.error) {
+          console.error('carousel fetch error:', query, byQuery[query].error);
+        }
+      }
+    } catch (e) {
+      console.error('batch carousel fetch failed:', e.message);
+      for (const query of queries) oidCache[query] = [];
+    }
+  }
 
   const output = [];
 
@@ -513,7 +516,6 @@ async function autoInjectCarousels(parsedJson) {
 
       if (promptSegs.length) output.push({ type: 'Paragraph', segments: promptSegs });
 
-      // Always inject a carousel for a resolved prompt — even if product fetch is empty
       if (sec.query) {
         output.push({
           type: 'PlushSearchCarousel',
